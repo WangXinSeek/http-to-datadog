@@ -9,6 +9,7 @@ exports.startServer = (options, onstart) => {
   const server = restify.createServer({
     name: APP_NAME
   });
+  const statsForwarder = dgram.createSocket('udp4');
 
   function tags(options) {
     const tags = options.tags || process.env.TAGS;
@@ -100,15 +101,41 @@ exports.startServer = (options, onstart) => {
     return next();
   }
 
+  function getBatches(stats, maxBatchSize) {
+    return stats.split('\n')
+      .filter(stat => stat.trim().length > 0)
+      .reduce((batches, currentStat, currentIndex, statsArray) => {
+        const currentBatchIndex = batches.length - 1;
+        const currentBatch = batches[currentBatchIndex];
+        const newBatch = currentBatch + (currentBatch.length > 0 ? '\n' : '') + currentStat;
+
+        if (newBatch.length < maxBatchSize) {
+          batches[currentBatchIndex] = newBatch;
+        } else {
+          batches.push(currentStat);
+        }
+        return batches;
+      }, ['']);
+  }
+
   function metricsReceived(req, res, next) {
     const tags = config.tags.slice(0);
-    const sender = dgram.createSocket('udp4');
     const startTime = req.time();
+    const maxBatchSize = 1024 * 8;
+    const statsBatches = getBatches(req.body, maxBatchSize);
 
-    sender.send(req.body, config.sinkPort, config.sinkHost, err => {
-      log.error(err); // record not interrupt
-      sender.close();
+    statsBatches.forEach(statsBatch => {
+      const statsBuffer = new Buffer(statsBatch);
+      statsForwarder.send(statsBuffer, 0, statsBuffer.length, config.sinkPort, config.sinkHost, err => {
+        if (err) {
+          increment('forward_error', tags);
+          log.error({err: err, msg: `error forwarding metric to ${config.sinkHost}:${config.sinkPort}`});
+        } else {
+          increment('forward_ok', tags);
+        }
+      });
     });
+
     tags.push('status-code:204');
     tags.push(`request-path:${config.appPath}`);
     timingFrom('response_time', startTime, tags);
